@@ -1,0 +1,163 @@
+name: Build ZENIX CLIENT (from ZIP)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate project (plain files or ZIP archive)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Repository files ==="
+          find . -type f ! -path './.git/*' | head -80
+
+          if [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/_project"
+          FOUND=""
+
+          while IFS= read -r -d '' f; do
+            if unzip -tq "$f" >/dev/null 2>&1 &&
+               unzip -Z1 "$f" | grep -Eq '(^|/)build\.gradle(\.kts)?$'; then
+              FOUND="$f"
+              break
+            fi
+          done < <(
+            find . -type f \
+              ! -path './.git/*' \
+              ! -path './.github/*' \
+              -size +20k -print0
+          )
+
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: No Gradle project or ZIP archive containing build.gradle was found."
+            exit 1
+          fi
+
+          echo "Archive: $FOUND"
+          unzip -oq "$FOUND" -d "$GITHUB_WORKSPACE/_project"
+
+          B=$(find "$GITHUB_WORKSPACE/_project" \
+            -maxdepth 5 \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            -type f | head -1)
+
+          if [ -z "$B" ]; then
+            echo "ERROR: Gradle build file not found after extraction."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$(dirname "$B")" >> "$GITHUB_ENV"
+          echo "Selected build file: $B"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.12'
+
+      - name: Validate Fabric metadata
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="src/main/resources/fabric.mod.json"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found."
+            find src -maxdepth 5 -type f 2>/dev/null | head -100 || true
+            exit 1
+          fi
+
+          python3 -m json.tool "$FILE" > /dev/null
+          echo "fabric.mod.json is valid JSON."
+
+      - name: Build mod and sources JAR
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon clean build
+
+      - name: Verify JAR contents
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Project directory ==="
+          pwd
+
+          echo "=== Java sources ==="
+          find src -type f -name '*.java' | head -100 || true
+
+          echo "=== Compiled classes ==="
+          find build/classes -type f -name '*.class' | head -100 || true
+
+          echo "=== Build output ==="
+          ls -lah build/libs/
+
+          J=""
+          for f in build/libs/*.jar; do
+            [ -f "$f" ] || continue
+            [[ "$f" == *-sources.jar ]] && continue
+
+            if unzip -Z1 "$f" | grep -qx 'fabric.mod.json'; then
+              J="$f"
+              break
+            fi
+          done
+
+          if [ -z "$J" ]; then
+            echo "ERROR: Main mod JAR not found."
+            exit 1
+          fi
+
+          echo "Selected JAR: $J"
+
+          CONTENTS=$(unzip -Z1 "$J")
+
+          check_class() {
+            if printf '%s\n' "$CONTENTS" | grep -Fxq "$1"; then
+              echo "FOUND: $1"
+            else
+              echo "MISSING: $1"
+              exit 1
+            fi
+          }
+
+          check_class "fabric.mod.json"
+          check_class "com/zenix/Zenix.class"
+          check_class "com/zenix/modules/BaseFinder.class"
+          check_class "com/zenix/ui/BotsScreen.class"
+
+          echo "JAR verification passed."
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenix-client-0.3.5-dev
+          path: ${{ env.PROJECT_DIR }}/build/libs/*.jar
+          if-no-files-found: warn
+          retention-days: 7
