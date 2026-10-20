@@ -8,9 +8,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check fresh repository
+      - name: Create test file
         run: |
-          echo "ZENIX TEST"
-          echo "Repository workflow is running"
-          echo "This is a fresh build test"
+          mkdir -p output
+          echo "ZENIX BUILD TEST SUCCESS" > output/zenix-test.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenix-build-test
+          path: output/zenix-test.txt
           
